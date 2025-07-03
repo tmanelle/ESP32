@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
 #include "esp_sleep.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -13,105 +14,190 @@
 
 // Broches SPI TMP126 (SIO = MOSI unique)
 #define PIN_CS 5    // GPIO5
-#define PIN_MOSI 23 // GPIO23 (SIO TMP126)
+#define PIN_MOSI 23 // GPIO23
 #define PIN_SCK 18  // GPIO18
 
-// Répétitions maximales avant veille profonde
+// Boutons poussoirs
+#define BUTTON1_PIN 0  // GPIO0 (UPLOAD)
+#define BUTTON2_PIN 15 // GPIO15 (utilisateur)
+bool button1Pressed = false;
+bool button2Pressed = false;
+
+// Répétitions maximales avant repos léger
 int repetitions = 0;
 const int maxRepetitions = 5;
 
-// Durée de veille (µs) en mode économie d'énergie
+// Durée de repos (µs)
 const uint64_t SLEEP_DURATION_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
 
-// BLE UUIDs (Health Thermometer profile)
+// BLE UUIDs
 const char *serviceUUID = "00001809-0000-1000-8000-00805f9b34fb";
-const char *charUUID = "00002A1C-0000-1000-8000-00805f9b34fb";
+const char *charUUID_TEMPERATURE = "00002A1C-0000-1000-8000-00805f9b34fb";
+const char *charUUID_CURRENT = "00002A19-0000-1000-8000-00805f9b34fb";
 
-// Pointeur vers la caractéristique température
+// Pointeurs vers les caractéristiques BLE
 BLECharacteristic *pTempCharacteristic;
+BLECharacteristic *pCurrentCharacteristic;
 
-// Déclarations de fonctions
+// INA237 I2C address
+#define INA237_ADDR 0x40
+
+//------------------------------------------------------------------------------
+// I2C helper functions for INA237
+void writeRegister(uint8_t reg, uint16_t value)
+{
+  Wire.beginTransmission(INA237_ADDR);
+  Wire.write(reg);
+  Wire.write((value >> 8) & 0xFF);
+  Wire.write(value & 0xFF);
+  Wire.endTransmission();
+}
+
+uint16_t readRegister(uint8_t reg)
+{
+  Wire.beginTransmission(INA237_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(INA237_ADDR, (uint8_t)2);
+  uint16_t hi = Wire.read();
+  uint16_t lo = Wire.read();
+  return (hi << 8) | lo;
+}
+
+// Initialize INA237
+void initINA237()
+{
+  writeRegister(0x00, 0x2027); // CONFIG: shunt+bus continuous, avg4, PGA×8
+  writeRegister(0x05, 0x0190); // CALIBRATION: Rshunt=10mΩ, LSB=100µA
+}
+
+// Read current in amperes
+float readCurrent_A()
+{
+  int16_t raw = (int16_t)readRegister(0x04);
+  return raw * 100e-6; // 100µA LSB
+}
+
+// Prototypes
 float readTemperatureTMP126();
 void blinkIndicator(int pin, int toneValue);
-void enterPowerSaveMode();
+void lightSleepCycle();
 
 void setup()
 {
   Serial.begin(115200);
   delay(100);
 
-  // Initialisation des LEDs et buzzer
+  // LEDs et buzzer
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_VERTE, OUTPUT);
   ledcSetup(0, 2000, 8);
   ledcAttachPin(BUZZER_PIN, 0);
 
-  // Initialisation SPI pour TMP126
+  // Boutons
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+
+  // SPI TMP126
   SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
   pinMode(PIN_CS, OUTPUT);
   digitalWrite(PIN_CS, HIGH);
 
-  // Initialisation BLE
-  BLEDevice::init("ESP32_Temp_BLE");
-  BLEServer *pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(serviceUUID);
+  // I2C + INA237
+  Wire.begin(21, 22);
+  initINA237();
 
-  pTempCharacteristic = pService->createCharacteristic(
-      charUUID,
-      BLECharacteristic::PROPERTY_READ |
-          BLECharacteristic::PROPERTY_NOTIFY);
+  // Bluetooth Low Energy
+  BLEDevice::init("ESP32_Temp_Current");
+  BLEServer *server = BLEDevice::createServer();
+  BLEService *service = server->createService(serviceUUID);
+
+  pTempCharacteristic = service->createCharacteristic(
+      charUUID_TEMPERATURE,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
   pTempCharacteristic->addDescriptor(new BLE2902());
-  pService->start();
 
-  BLEAdvertising *pAdvertising = pServer->getAdvertising();
-  pAdvertising->start();
-  Serial.println("BLE Thermometer prêt");
+  pCurrentCharacteristic = service->createCharacteristic(
+      charUUID_CURRENT,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  pCurrentCharacteristic->addDescriptor(new BLE2902());
+
+  service->start();
+  server->getAdvertising()->start();
+  Serial.println("BLE Thermometer + Current ready");
 }
 
 void loop()
 {
-  // Passage en veille si nombre de mesures atteint
-  if (repetitions >= maxRepetitions)
+  // Gestion boutons
+  if (digitalRead(BUTTON1_PIN) == LOW)
   {
-    enterPowerSaveMode();
+    Serial.println("Button 1 pressed");
+    button1Pressed = true;
+    blinkIndicator(LED_RED, 200);
+  }
+  if (digitalRead(BUTTON2_PIN) == LOW)
+  {
+    Serial.println("Button 2 pressed");
+    button2Pressed = true;
+    blinkIndicator(LED_VERTE, 200);
   }
 
-  // Lecture température
+  // Température
   float tempC = readTemperatureTMP126();
-  Serial.printf("Température (°C) : %.2f\n", tempC);
-
-  // Mise à jour BLE (format centi-degrés)
+  Serial.printf("Temperature: %.2f C\n", tempC);
   int16_t tempInt = (int16_t)(tempC * 100);
   pTempCharacteristic->setValue((uint8_t *)&tempInt, sizeof(tempInt));
   pTempCharacteristic->notify();
 
-  // Indication locale avec LEDs et buzzer
+  // Courant
+  float currentA = readCurrent_A();
+  Serial.printf("Current: %.3f A\n", currentA);
+  int16_t currInt = (int16_t)(currentA * 1000); // mA
+  pCurrentCharacteristic->setValue((uint8_t *)&currInt, sizeof(currInt));
+  pCurrentCharacteristic->notify();
+
+  // Indicas locales
   blinkIndicator(LED_RED, 128);
   blinkIndicator(LED_VERTE, 128);
 
   repetitions++;
-
-  // Entrée en veille entre cycles
-  enterPowerSaveMode();
+  if (repetitions >= maxRepetitions)
+  {
+    lightSleepCycle();
+    repetitions = 0;
+  }
+  else
+  {
+    lightSleepCycle();
+  }
 }
 
-// Fonction de clignotement LED + buzzer
+// Clignotement LED + buzzer
 void blinkIndicator(int pin, int toneValue)
 {
   digitalWrite(pin, HIGH);
   ledcWrite(0, toneValue);
-  delay(500);
+  delay(300);
   digitalWrite(pin, LOW);
   ledcWrite(0, 0);
-  delay(500);
+  delay(200);
 }
 
-// Lecture SPI TMP126
+// Repos léger (Light Sleep) - garde BLE actif
+void lightSleepCycle()
+{
+  Serial.println("Entering light sleep...");
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+  esp_light_sleep_start();
+  Serial.println("Woke up from light sleep");
+}
+
+// Lecture TMP126
 float readTemperatureTMP126()
 {
-  uint16_t rawValue;
+  uint16_t raw;
   uint8_t msb, lsb;
-
   SPI.beginTransaction(SPISettings(100000, MSBFIRST, SPI_MODE0));
   digitalWrite(PIN_CS, LOW);
   SPI.transfer(0x00);
@@ -119,23 +205,9 @@ float readTemperatureTMP126()
   lsb = SPI.transfer(0x00);
   digitalWrite(PIN_CS, HIGH);
   SPI.endTransaction();
-
-  rawValue = (msb << 8) | lsb;
-  if (rawValue & 0x2000)
-    rawValue |= 0xC000; // extension du signe
-  int16_t signedTemp = (int16_t)rawValue;
-  return signedTemp * 0.03125;
-}
-
-// Passage en veille profonde
-void enterPowerSaveMode()
-{
-  Serial.println("Entering power save mode...");
-  digitalWrite(LED_RED, LOW);
-  digitalWrite(LED_VERTE, LOW);
-  ledcWrite(0, 0);
-
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
-  Serial.printf("Sleeping for %llu seconds...\n", SLEEP_DURATION_US / 1000000ULL);
-  esp_deep_sleep_start();
+  raw = (msb << 8) | lsb;
+  if (raw & 0x2000)
+    raw |= 0xC000;
+  int16_t st = (int16_t)raw;
+  return st * 0.03125;
 }
