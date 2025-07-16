@@ -19,16 +19,9 @@
 
 // Boutons poussoirs
 #define BUTTON1_PIN 0  // GPIO0 (UPLOAD)
-#define BUTTON2_PIN 15 // GPIO15 (utilisateur)
+#define BUTTON2_PIN 15 // GPIO15 (mode light sleep)
 bool button1Pressed = false;
 bool button2Pressed = false;
-
-// Répétitions maximales avant repos léger
-int repetitions = 0;
-const int maxRepetitions = 5;
-
-// Durée de repos (µs)
-const uint64_t SLEEP_DURATION_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
 
 // BLE UUIDs
 const char *serviceUUID = "00001809-0000-1000-8000-00805f9b34fb";
@@ -43,7 +36,7 @@ BLECharacteristic *pCurrentCharacteristic;
 #define INA237_ADDR 0x40
 
 //------------------------------------------------------------------------------
-// I2C helper functions for INA237
+// I2C helper for INA237
 void writeRegister(uint8_t reg, uint16_t value)
 {
   Wire.beginTransmission(INA237_ADDR);
@@ -64,14 +57,14 @@ uint16_t readRegister(uint8_t reg)
   return (hi << 8) | lo;
 }
 
-// Initialize INA237
+// Initialise INA237
 void initINA237()
 {
-  writeRegister(0x00, 0x2027); // CONFIG: shunt+bus continuous, avg4, PGA×8
-  writeRegister(0x05, 0x0190); // CALIBRATION: Rshunt=10mΩ, LSB=100µA
+  writeRegister(0x00, 0x2027); // CONFIG
+  writeRegister(0x05, 0x0190); // CALIBRATION
 }
 
-// Read current in amperes
+// Lit le courant en A
 float readCurrent_A()
 {
   int16_t raw = (int16_t)readRegister(0x04);
@@ -81,7 +74,7 @@ float readCurrent_A()
 // Prototypes
 float readTemperatureTMP126();
 void blinkIndicator(int pin, int toneValue);
-void lightSleepCycle();
+void enterLightSleep();
 
 void setup()
 {
@@ -107,7 +100,7 @@ void setup()
   Wire.begin(21, 22);
   initINA237();
 
-  // Bluetooth Low Energy
+  // BLE
   BLEDevice::init("ESP32_Temp_Current");
   BLEServer *server = BLEDevice::createServer();
   BLEService *service = server->createService(serviceUUID);
@@ -129,51 +122,45 @@ void setup()
 
 void loop()
 {
-  // Gestion boutons
+  // Bouton Upload
   if (digitalRead(BUTTON1_PIN) == LOW)
   {
-    Serial.println("Button 1 pressed");
+    Serial.println("Button 1 (UPLOAD) pressed");
     button1Pressed = true;
     blinkIndicator(LED_RED, 200);
   }
+
+  // Bouton Light Sleep
   if (digitalRead(BUTTON2_PIN) == LOW)
   {
-    Serial.println("Button 2 pressed");
+    Serial.println("Button 2 (Light Sleep) pressed");
     button2Pressed = true;
     blinkIndicator(LED_VERTE, 200);
+    enterLightSleep();
   }
 
-  // Température
+  // Lecture température
   float tempC = readTemperatureTMP126();
   Serial.printf("Temperature: %.2f C\n", tempC);
   int16_t tempInt = (int16_t)(tempC * 100);
   pTempCharacteristic->setValue((uint8_t *)&tempInt, sizeof(tempInt));
   pTempCharacteristic->notify();
 
-  // Courant
+  // Lecture courant
   float currentA = readCurrent_A();
   Serial.printf("Current: %.3f A\n", currentA);
-  int16_t currInt = (int16_t)(currentA * 1000); // mA
+  int16_t currInt = (int16_t)(currentA * 1000);
   pCurrentCharacteristic->setValue((uint8_t *)&currInt, sizeof(currInt));
   pCurrentCharacteristic->notify();
 
-  // Indicas locales
+  // Indicateurs
   blinkIndicator(LED_RED, 128);
   blinkIndicator(LED_VERTE, 128);
 
-  repetitions++;
-  if (repetitions >= maxRepetitions)
-  {
-    lightSleepCycle();
-    repetitions = 0;
-  }
-  else
-  {
-    lightSleepCycle();
-  }
+  // Pas de mode économie automatique
+  delay(1000); // temporisation entre lectures
 }
 
-// Clignotement LED + buzzer
 void blinkIndicator(int pin, int toneValue)
 {
   digitalWrite(pin, HIGH);
@@ -184,16 +171,14 @@ void blinkIndicator(int pin, int toneValue)
   delay(200);
 }
 
-// Repos léger (Light Sleep) - garde BLE actif
-void lightSleepCycle()
+void enterLightSleep()
 {
   Serial.println("Entering light sleep...");
-  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+  esp_sleep_enable_timer_wakeup(5ULL * 60ULL * 1000000ULL);
   esp_light_sleep_start();
   Serial.println("Woke up from light sleep");
 }
 
-// Lecture TMP126
 float readTemperatureTMP126()
 {
   uint16_t raw;
